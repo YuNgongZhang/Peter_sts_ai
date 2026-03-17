@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(python -c \":*)",
+      "Bash(python3 -c \":*)",
+      "Bash(\"/c/Users/peter/AppData/Local/Programs/Python/Python312/python.exe\" -c \":*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.toypiper.com)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:gigazine.net)",
+      "WebFetch(domain:news.ycombinator.com)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:www.toolify.ai)"
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+# spirecomm is vendored in spirecomm/ — no separate install needed.
+# To install it as a package instead:
+#   pip install git+https://github.com/ForgottenArbiter/spirecomm.git
+requests
