@@ -10,8 +10,13 @@ env/
 
 # Runtime
 sts_state.log
+training_data/
+active_session.json
+*.log
+*.jsonl
 
 # IDE
 .vscode/
 .idea/
 *.swp
+.claude/

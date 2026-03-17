@@ -22,7 +22,12 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from ai.card_stats import JUNK_IDS
-from ai.card_rewards import pick_best_reward
+from ai.card_rewards import (
+    estimate_best_upgrade_gain,
+    pick_best_reward,
+    pick_best_shop_card,
+    pick_grid_cards,
+)
 from ai.simulator import plan_best_sequence
 from spirecomm.spire.screen import RestOption
 from spirecomm.ai.priorities import IroncladPriority
@@ -71,6 +76,8 @@ def decide_action(game_state: Dict[str, Any]) -> str:
     if screen_type == "SHOP_SCREEN":   return _decide_shop_screen(game_state)
     if screen_type == "GRID":          return _decide_grid(game_state)
     if screen_type == "HAND_SELECT":   return _decide_hand_select(game_state)
+    if screen_type == "GAME_OVER":     return _decide_game_over(game_state)
+    if screen_type == "COMPLETE":      return _decide_complete(game_state)
 
     # 未知屏幕有选项 -> 选第一个（Neow 开局奖励等）
     if game_state.get("choice_available", False):
@@ -97,13 +104,20 @@ def _decide_combat_reward(game_state: Dict[str, Any]) -> str:
 
 
 def _decide_card_reward(game_state: Dict[str, Any]) -> str:
-    """用 IroncladPriority 选最优奖励卡，或跳过。"""
+    """按当前牌组协同选择奖励卡，必要时跳过。"""
     cards = game_state.get("reward_cards", [])
-    idx, card = pick_best_reward(cards)
+    idx, card, reason = pick_best_reward(
+        cards,
+        deck_cards=game_state.get("deck_cards", []),
+        relic_ids=game_state.get("relic_ids", []),
+        floor=game_state.get("floor"),
+        act=game_state.get("act"),
+        can_skip=game_state.get("card_reward_can_skip", True),
+    )
     if idx is None:
-        game_state["_decision_reason"] = "reward_skip"
+        game_state["_decision_reason"] = f"reward_skip_{reason}"
         return "skip_card_reward"
-    game_state["_decision_reason"] = f"reward_{getattr(card, 'card_id', '?')}"
+    game_state["_decision_reason"] = f"reward_{getattr(card, 'card_id', '?')}_{reason}"
     return f"choose_card_reward_{idx}"
 
 
@@ -131,13 +145,16 @@ def _decide_map(game_state: Dict[str, Any]) -> str:
     """按节点类型优先级选择最优路径。"""
     map_nodes      = game_state.get("map_nodes", [])
     boss_available = game_state.get("boss_available", False)
+    choice_available = game_state.get("choice_available", False)
 
     if boss_available and not map_nodes:
         game_state["_decision_reason"] = "map_boss"
         return "choose_map_boss"
     if not map_nodes:
-        game_state["_decision_reason"] = "map_no_nodes"
-        return "choose_map_boss"
+        game_state["_decision_reason"] = (
+            "map_wait_transition" if not choice_available else "map_no_nodes"
+        )
+        return "wait"
 
     best_idx = min(
         range(len(map_nodes)),
@@ -210,6 +227,14 @@ def _decide_rest(game_state: Dict[str, Any]) -> str:
     max_hp       = game_state.get("max_hp", 80) or 80
     act          = game_state.get("act", 1)
     floor_num    = game_state.get("floor", 1)
+    deck_cards   = game_state.get("deck_cards", [])
+    upgrade_gain = estimate_best_upgrade_gain(
+        deck_cards,
+        deck_cards=deck_cards,
+        relic_ids=game_state.get("relic_ids", []),
+        floor=floor_num,
+        act=act,
+    )
 
     if has_rested or not rest_options:
         game_state["_decision_reason"] = "rest_proceed"
@@ -228,7 +253,7 @@ def _decide_rest(game_state: Dict[str, Any]) -> str:
         game_state["_decision_reason"] = "rest_heal_preboss"
         return "rest_REST"
 
-    if RestOption.SMITH in rest_options:
+    if RestOption.SMITH in rest_options and upgrade_gain >= 4:
         game_state["_decision_reason"] = "rest_smith"
         return "rest_SMITH"
 
@@ -272,6 +297,10 @@ def _decide_shop_screen(game_state: Dict[str, Any]) -> str:
     gold         = game_state.get("gold", 0)
     shop_cards   = game_state.get("shop_cards", [])
     shop_relics  = game_state.get("shop_relics", [])
+    deck_cards   = game_state.get("deck_cards", [])
+    relic_ids    = game_state.get("relic_ids", [])
+    floor_num    = game_state.get("floor", 1)
+    act          = game_state.get("act", 1)
     purge_avail  = game_state.get("purge_available", False)
     purge_cost   = game_state.get("purge_cost", 9999)
 
@@ -279,11 +308,17 @@ def _decide_shop_screen(game_state: Dict[str, Any]) -> str:
         game_state["_decision_reason"] = "shop_purge"
         return "shop_purge"
 
-    for i, card in enumerate(shop_cards):
-        price = getattr(card, "price", 9999)
-        if gold >= price and not _priority.should_skip(card):
-            game_state["_decision_reason"] = f"shop_card_{getattr(card,'card_id','?')}"
-            return f"buy_card_{i}"
+    card_idx, card, reason = pick_best_shop_card(
+        shop_cards,
+        gold=gold,
+        deck_cards=deck_cards,
+        relic_ids=relic_ids,
+        floor=floor_num,
+        act=act,
+    )
+    if card_idx is not None:
+        game_state["_decision_reason"] = f"shop_card_{getattr(card,'card_id','?')}_{reason}"
+        return f"buy_card_{card_idx}"
 
     for i, relic in enumerate(shop_relics):
         price = getattr(relic, "price", 9999)
@@ -313,25 +348,28 @@ def _decide_grid(game_state: Dict[str, Any]) -> str:
     cards     = game_state.get("grid_cards", [])
     num_cards = game_state.get("grid_num_cards", 1)
     for_purge = game_state.get("for_purge", False)
+    for_upgrade = game_state.get("for_upgrade", False)
 
     if not cards:
         game_state["_decision_reason"] = "grid_no_cards"
         return "proceed"
 
-    sorted_cards = _priority.get_sorted_cards(cards, reverse=for_purge)
-    selected     = sorted_cards[:num_cards]
-    indices      = []
-    for c in selected:
-        try:
-            indices.append(cards.index(c))
-        except ValueError:
-            pass
+    indices, reason = pick_grid_cards(
+        cards,
+        deck_cards=game_state.get("deck_cards", cards),
+        relic_ids=game_state.get("relic_ids", []),
+        floor=game_state.get("floor"),
+        act=game_state.get("act"),
+        num_cards=num_cards,
+        for_purge=for_purge,
+        for_upgrade=for_upgrade,
+    )
 
     if not indices:
         game_state["_decision_reason"] = "grid_no_indices"
         return "proceed"
 
-    game_state["_decision_reason"] = "grid_select"
+    game_state["_decision_reason"] = f"grid_{reason}"
     return "grid_select_" + "_".join(str(i) for i in indices)
 
 
@@ -367,6 +405,18 @@ def _decide_hand_select(game_state: Dict[str, Any]) -> str:
 
     game_state["_decision_reason"] = "hand_select"
     return "hand_select_" + "_".join(str(i) for i in indices)
+
+
+def _decide_game_over(game_state: Dict[str, Any]) -> str:
+    game_state["_decision_reason"] = (
+        "victory" if game_state.get("game_over_victory") else "defeat"
+    )
+    return "proceed"
+
+
+def _decide_complete(game_state: Dict[str, Any]) -> str:
+    game_state["_decision_reason"] = "complete_proceed"
+    return "proceed"
 
 
 # =============================================================================

@@ -13,6 +13,41 @@ def explain_action(game_state: Dict[str, Any], action: str) -> str:
     enemy_intent = game_state.get("enemy_intent") or "unknown"
     reason       = game_state.get("_decision_reason", "priority_list")
 
+    if action == "skip_card_reward":
+        return f"Skipping card reward. Reason: {reason}."
+
+    if action.startswith("choose_card_reward_"):
+        card_name = _screen_card_name(action, game_state.get("reward_cards") or [])
+        return f"Taking reward card {card_name}. Reason: {reason}."
+
+    if action.startswith("buy_card_"):
+        card_name = _screen_card_name(action, game_state.get("shop_cards") or [], prefix="buy_card_")
+        return f"Buying shop card {card_name}. Reason: {reason}."
+
+    if action == "shop_purge":
+        return f"Using shop purge. Reason: {reason}."
+
+    if action == "shop_leave":
+        return "Leaving shop because no purchase met the threshold."
+
+    if action.startswith("rest_"):
+        return f"Taking rest action {action[5:]}. Reason: {reason}."
+
+    if action.startswith("grid_select_"):
+        return f"Selecting grid cards. Reason: {reason}."
+
+    if action.startswith("take_combat_reward_"):
+        return f"Claiming combat reward. Reason: {reason}."
+
+    if action.startswith("take_boss_reward_"):
+        return f"Taking boss relic reward. Reason: {reason}."
+
+    if action.startswith("choose_event_"):
+        return f"Choosing event option. Reason: {reason}."
+
+    if action.startswith("choose_map_node_") or action == "choose_map_boss":
+        return f"Choosing map path. Reason: {reason}."
+
     # ── End turn ─────────────────────────────────────────────────────────────
     if action == "end_turn":
         if reason in ("no_energy", "no_playable"):
@@ -38,6 +73,18 @@ def _card_name(action: str, hand: list) -> str:
             idx = int(action.split("_")[-1])
             if 0 <= idx < len(hand):
                 return hand[idx]
+        except (ValueError, IndexError):
+            pass
+    return "chosen card"
+
+
+def _screen_card_name(action: str, cards: list, prefix: str = "choose_card_reward_") -> str:
+    if action.startswith(prefix):
+        try:
+            idx = int(action[len(prefix):])
+            if 0 <= idx < len(cards):
+                card = cards[idx]
+                return getattr(card, "card_id", getattr(card, "name", "chosen card"))
         except (ValueError, IndexError):
             pass
     return "chosen card"
