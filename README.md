@@ -20,6 +20,7 @@ STS (Java) ──CommunicationMod──► spirecomm ──► main.py ──►
 | `launch_training.py` | Windows launcher for single/multi-instance data collection |
 | `run_cloud.ps1` | PowerShell wrapper for cloud dry-run + launch |
 | `run_cloud_watchdog.ps1` | PowerShell watchdog for long-running cloud sampling |
+| `validate_dataset.py` | JSONL validator for pre-training dataset checks |
 | `spirecomm/` | Vendored spirecomm library (ForgottenArbiter, MIT) |
 
 ## Decision Tree — Screen Coverage
@@ -93,6 +94,8 @@ The bot now writes one JSONL file per launched instance. Each line contains:
 - current game state snapshot
 - chosen action
 - action explanation
+- episode id / step index / terminal flag
+- current full dungeon map snapshot
 - session / instance metadata
 
 Default output layout:
@@ -100,8 +103,10 @@ Default output layout:
 training_data/<session_id>/
   instance-0.jsonl
   instance-0.log
+  instance-0.episodes.jsonl
   instance-1.jsonl
   instance-1.log
+  instance-1.episodes.jsonl
 ```
 
 Single instance:
@@ -163,6 +168,29 @@ Dry-run only:
 ```
 
 Long-run deployment notes are documented in [CLOUD_SAMPLING_PLAN.md](D:\sts_ai\CLOUD_SAMPLING_PLAN.md).
+
+Validate the latest collected session before training:
+```powershell
+py -3 validate_dataset.py --data-dir training_data
+```
+
+Export the latest validated session into a training-ready table:
+```powershell
+py -3 export_training_table.py --data-dir training_data
+```
+
+Export a specific session:
+```powershell
+py -3 export_training_table.py --data-dir training_data --session <session_id>
+```
+
+The export writes `training_table.jsonl` inside the session directory and joins:
+- per-step decision traces from `instance-*.jsonl`
+- per-episode outcomes from `instance-*.episodes.jsonl`
+
+Optional combat search tuning:
+- `STS_AI_DFS_TIMEOUT_MS` controls the per-turn DFS timeout in milliseconds
+- `STS_AI_DFS_MAX_NODES` controls the per-turn DFS node budget
 
 ## Credits
 

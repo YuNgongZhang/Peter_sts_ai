@@ -12,10 +12,28 @@ ai/simulator.py — 单回合 DFS 最优出牌序列规划器
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+import os
+import time
 from typing import List, Optional
 
 from spirecomm.spire.character import Intent
 from ai.card_stats import IRONCLAD_STATS, JUNK_IDS, get_card_stats
+
+
+DFS_TIMEOUT_SECONDS = max(
+    0.005,
+    float(os.environ.get("STS_AI_DFS_TIMEOUT_MS", "60")) / 1000.0,
+)
+DFS_MAX_NODES = max(
+    100,
+    int(os.environ.get("STS_AI_DFS_MAX_NODES", "5000")),
+)
+LAST_PLAN_METADATA = {
+    "timed_out": False,
+    "node_budget_hit": False,
+    "nodes_explored": 0,
+    "timeout_seconds": DFS_TIMEOUT_SECONDS,
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +249,10 @@ def _score(state: SimState, incoming: int, multi_monster: bool) -> float:
     return score
 
 
+def get_last_plan_metadata() -> dict:
+    return dict(LAST_PLAN_METADATA)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DFS 枚举
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,9 +295,23 @@ def plan_best_sequence(raw) -> list:
 
     best_score:    float = -1e9
     best_sequence: list  = []
+    start_time = time.perf_counter()
+    nodes_explored = 0
+    timed_out = False
+    node_budget_hit = False
 
     def dfs(remaining: list, state: SimState) -> None:
-        nonlocal best_score, best_sequence
+        nonlocal best_score, best_sequence, nodes_explored, timed_out, node_budget_hit
+
+        if timed_out or node_budget_hit:
+            return
+        if (time.perf_counter() - start_time) >= DFS_TIMEOUT_SECONDS:
+            timed_out = True
+            return
+        if nodes_explored >= DFS_MAX_NODES:
+            node_budget_hit = True
+            return
+        nodes_explored += 1
 
         # 给当前节点打分
         sc = _score(state, incoming, multi_monster)
@@ -303,4 +339,12 @@ def plan_best_sequence(raw) -> list:
             dfs(new_remaining, new_state)
 
     dfs(candidates, initial)
+    LAST_PLAN_METADATA.update(
+        {
+            "timed_out": timed_out,
+            "node_budget_hit": node_budget_hit,
+            "nodes_explored": nodes_explored,
+            "timeout_seconds": DFS_TIMEOUT_SECONDS,
+        }
+    )
     return best_sequence

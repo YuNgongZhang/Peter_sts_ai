@@ -31,7 +31,7 @@ from ai.card_rewards import (
     score_reward_options,
     score_shop_card_options,
 )
-from ai.simulator import plan_best_sequence
+from ai.simulator import get_last_plan_metadata, plan_best_sequence
 from spirecomm.spire.screen import RestOption
 from spirecomm.ai.priorities import IroncladPriority
 
@@ -671,8 +671,12 @@ def _decide_combat(game_state: Dict[str, Any]) -> str:
             _planned_uuids = []
 
     sequence = plan_best_sequence(raw)
+    plan_meta = get_last_plan_metadata()
     if not sequence:
-        game_state["_decision_reason"] = "no_playable"
+        if plan_meta.get("timed_out") or plan_meta.get("node_budget_hit"):
+            game_state["_decision_reason"] = "dfs_timeout_no_playable"
+        else:
+            game_state["_decision_reason"] = "no_playable"
         return "end_turn"
 
     _planned_uuids = [getattr(c, "uuid", "") for c in sequence[1:]]
@@ -684,5 +688,8 @@ def _decide_combat(game_state: Dict[str, Any]) -> str:
         game_state["_decision_reason"] = "index_error"
         return "end_turn"
 
-    game_state["_decision_reason"] = "dfs_plan"
+    if plan_meta.get("timed_out") or plan_meta.get("node_budget_hit"):
+        game_state["_decision_reason"] = "dfs_timeout_plan"
+    else:
+        game_state["_decision_reason"] = "dfs_plan"
     return f"play_card_{idx}"

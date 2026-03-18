@@ -74,7 +74,7 @@ def _load_active_session_from_registry() -> tuple[str, str, str] | None:
         _release_file_lock(fd, lock_path)
 
 
-def _resolve_runtime_paths() -> tuple[str, str, str, str, str]:
+def _resolve_runtime_paths() -> tuple[str, str, str, str, str, str]:
     data_dir = os.environ.get("STS_AI_DATA_DIR")
     session_id = os.environ.get("STS_AI_SESSION_ID")
     instance_id = os.environ.get("STS_AI_INSTANCE_ID")
@@ -101,10 +101,14 @@ def _resolve_runtime_paths() -> tuple[str, str, str, str, str]:
         "STS_AI_LOG_PATH",
         os.path.join(session_dir, f"{instance_id}.log"),
     )
-    return data_dir, session_id, instance_id, jsonl_path, log_path
+    episode_summary_path = os.environ.get(
+        "STS_AI_EPISODE_SUMMARY_PATH",
+        os.path.join(session_dir, f"{instance_id}.episodes.jsonl"),
+    )
+    return data_dir, session_id, instance_id, jsonl_path, log_path, episode_summary_path
 
 
-DATA_DIR, SESSION_ID, INSTANCE_ID, JSONL_PATH, LOG_PATH = _resolve_runtime_paths()
+DATA_DIR, SESSION_ID, INSTANCE_ID, JSONL_PATH, LOG_PATH, EPISODE_SUMMARY_PATH = _resolve_runtime_paths()
 
 
 def _read_session_registry() -> dict:
@@ -141,6 +145,8 @@ RUN_SEED = os.environ.get("STS_AI_SEED") or SESSION_REGISTRY.get("seed")
 
 _last_state_fingerprint: tuple = ()
 _start_requested = False
+_current_episode_id: str | None = None
+_episode_step_index = 0
 
 # 这些屏幕无论 play/end/choice_available 是否为 True，都必须到达 decide_action
 _ACTIVE_SCREENS = frozenset({
@@ -235,10 +241,15 @@ def _safe_value(value):
 
 
 def _record_training_example(state_dict, action_str: str, explanation: str) -> None:
+    global _episode_step_index
+    episode_id = _ensure_episode_id()
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "session_id": SESSION_ID,
         "instance_id": INSTANCE_ID,
+        "episode_id": episode_id,
+        "step_index": _episode_step_index,
+        "terminal": bool(state_dict.get("screen_type") in {"GAME_OVER", "COMPLETE"}),
         "floor": state_dict.get("floor"),
         "act": state_dict.get("act"),
         "screen_type": state_dict.get("screen_type"),
@@ -256,6 +267,39 @@ def _record_training_example(state_dict, action_str: str, explanation: str) -> N
     safe_record = _sanitize_json_compatible(record)
     with open(JSONL_PATH, "a", encoding="utf-8", errors="backslashreplace") as f:
         f.write(json.dumps(safe_record, ensure_ascii=True) + "\n")
+    _episode_step_index += 1
+
+
+def _record_episode_summary(state_dict) -> None:
+    episode_id = _ensure_episode_id()
+    summary = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "session_id": SESSION_ID,
+        "instance_id": INSTANCE_ID,
+        "episode_id": episode_id,
+        "character": state_dict.get("character"),
+        "seed": state_dict.get("seed"),
+        "victory": bool(state_dict.get("game_over_victory")),
+        "score": state_dict.get("game_over_score"),
+        "act_reached": state_dict.get("act"),
+        "floor_reached": state_dict.get("floor"),
+        "final_hp": state_dict.get("current_hp"),
+        "max_hp": state_dict.get("max_hp"),
+        "deck_card_ids": _safe_value(state_dict.get("deck_card_ids", [])),
+        "relic_ids": _safe_value(state_dict.get("relic_ids", [])),
+        "act_boss": _safe_value(state_dict.get("act_boss")),
+        "steps": _episode_step_index,
+    }
+    safe_summary = _sanitize_json_compatible(summary)
+    with open(EPISODE_SUMMARY_PATH, "a", encoding="utf-8", errors="backslashreplace") as f:
+        f.write(json.dumps(safe_summary, ensure_ascii=True) + "\n")
+
+
+def _ensure_episode_id() -> str:
+    global _current_episode_id
+    if _current_episode_id is None:
+        _current_episode_id = uuid.uuid4().hex[:12]
+    return _current_episode_id
 
 
 def _get_player_class() -> PlayerClass:
@@ -310,6 +354,36 @@ def _parse_relic_ids(game_state) -> list[str]:
     except TypeError:
         pass
     return ids
+
+
+def _serialize_full_map(game_state) -> list[dict]:
+    dungeon_map = getattr(game_state, "map", None)
+    nodes = getattr(dungeon_map, "nodes", None)
+    if not isinstance(nodes, dict):
+        return []
+
+    serialized = []
+    for y in sorted(nodes):
+        row = nodes.get(y, {})
+        if not isinstance(row, dict):
+            continue
+        for x in sorted(row):
+            node = row.get(x)
+            if node is None:
+                continue
+            children = [
+                {"x": getattr(child, "x", None), "y": getattr(child, "y", None)}
+                for child in getattr(node, "children", []) or []
+            ]
+            serialized.append(
+                {
+                    "x": getattr(node, "x", None),
+                    "y": getattr(node, "y", None),
+                    "symbol": getattr(node, "symbol", ""),
+                    "children": children,
+                }
+            )
+    return serialized
 
 
 def _parse_enemy_intent(game_state) -> str:
@@ -554,7 +628,7 @@ def _build_spirecomm_action(action_str: str, game_state):
 
 
 def on_state_change(game_state):
-    global _last_state_fingerprint, _start_requested
+    global _last_state_fingerprint, _start_requested, _current_episode_id, _episode_step_index
     _start_requested = False
 
     in_combat      = bool(getattr(game_state, "in_combat",         False))
@@ -602,15 +676,24 @@ def on_state_change(game_state):
     deck_cards = _parse_deck(game_state)
     deck_card_ids = [getattr(card, "card_id", "") for card in deck_cards if getattr(card, "card_id", "")]
     relic_ids = _parse_relic_ids(game_state)
+    full_map = _serialize_full_map(game_state)
+    act_boss = getattr(game_state, "act_boss", None)
 
     # ── 各屏幕特定数据提取 ────────────────────────────────────────────────────
 
     # 地图
-    map_nodes, boss_available = [], False
+    map_nodes, boss_available, map_current_node = [], False, None
     if screen_type == ScreenType.MAP and screen is not None:
         raw_nodes      = getattr(screen, "next_nodes", []) or []
         map_nodes      = [{"symbol": n.symbol, "x": n.x, "y": n.y} for n in raw_nodes]
         boss_available = bool(getattr(screen, "boss_available", False))
+        current_node = getattr(screen, "current_node", None)
+        if current_node is not None:
+            map_current_node = {
+                "symbol": getattr(current_node, "symbol", ""),
+                "x": getattr(current_node, "x", None),
+                "y": getattr(current_node, "y", None),
+            }
 
     # 卡牌奖励 / 战斗奖励
     reward_cards, combat_rewards = [], []
@@ -684,8 +767,9 @@ def on_state_change(game_state):
     # ── 去重 ──────────────────────────────────────────────────────────────────
     fingerprint = (
         in_combat, play_available, screen_name,
+        act, floor_num, room_phase_name, room_type_name,
         player_hp, energy, tuple(hand_names), enemy_intent,
-        tuple(n["symbol"] for n in map_nodes), boss_available,
+        tuple((n["symbol"], n["x"], n["y"]) for n in map_nodes), boss_available,
         tuple(getattr(c, "card_id", "") for c in reward_cards),
         card_reward_can_skip, card_reward_can_bowl,
         len(combat_rewards),
@@ -766,7 +850,10 @@ def on_state_change(game_state):
         "choice_available":  choice_avail,
         # 地图
         "map_nodes":         map_nodes,
+        "map_current_node":  map_current_node,
+        "full_map":          full_map,
         "boss_available":    boss_available,
+        "act_boss":          act_boss,
         # 奖励
         "reward_cards":      reward_cards,
         "card_reward_can_skip": card_reward_can_skip,
@@ -810,6 +897,10 @@ def on_state_change(game_state):
     action_str  = _decision.decide_action(state_dict)
     explanation = explain_action(state_dict, action_str)
     _record_training_example(state_dict, action_str, explanation)
+    if screen_name in {"GAME_OVER", "COMPLETE"}:
+        _record_episode_summary(state_dict)
+        _current_episode_id = None
+        _episode_step_index = 0
     log(f"-> {action_str}  ({explanation})")
     log("-" * 40)
 
@@ -817,8 +908,11 @@ def on_state_change(game_state):
 
 
 def on_out_of_game():
-    global _start_requested
+    global _start_requested, _current_episode_id, _episode_step_index
     if AUTO_START_NEW_RUNS and not _start_requested:
+        if _current_episode_id is None:
+            _current_episode_id = uuid.uuid4().hex[:12]
+            _episode_step_index = 0
         _start_requested = True
         log(
             f"[OUT_OF_GAME] auto_start class={_get_player_class().name} "
