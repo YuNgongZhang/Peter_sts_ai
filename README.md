@@ -19,6 +19,7 @@ STS (Java) ──CommunicationMod──► spirecomm ──► main.py ──►
 | `ai/explanation.py` | Human-readable log annotations |
 | `launch_training.py` | Windows launcher for single/multi-instance data collection |
 | `run_cloud.ps1` | PowerShell wrapper for cloud dry-run + launch |
+| `run_cloud_watchdog.ps1` | PowerShell watchdog for long-running cloud sampling |
 | `spirecomm/` | Vendored spirecomm library (ForgottenArbiter, MIT) |
 
 ## Decision Tree — Screen Coverage
@@ -151,10 +152,17 @@ On a Windows cloud machine, the shortest path is:
 .\run_cloud.ps1 -StsDir "D:\Steam\steamapps\common\SlayTheSpire" -SteamRoot "D:\Steam" -Instances 1
 ```
 
+For unattended long-running sampling with automatic restart:
+```powershell
+.\run_cloud_watchdog.ps1 -StsDir "D:\Steam\steamapps\common\SlayTheSpire" -SteamRoot "D:\Steam" -Instances 1
+```
+
 Dry-run only:
 ```powershell
 .\run_cloud.ps1 -StsDir "D:\Steam\steamapps\common\SlayTheSpire" -SteamRoot "D:\Steam" -DryRunOnly
 ```
+
+Long-run deployment notes are documented in [CLOUD_SAMPLING_PLAN.md](D:\sts_ai\CLOUD_SAMPLING_PLAN.md).
 
 ## Credits
 

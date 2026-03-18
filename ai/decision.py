@@ -19,14 +19,17 @@ screen_type 分发:
 """
 
 from __future__ import annotations
+from itertools import combinations
 from typing import Any, Dict
 
 from ai.card_stats import JUNK_IDS
 from ai.card_rewards import (
+    card_priority_score,
+    estimate_purge_gain,
     estimate_best_upgrade_gain,
-    pick_best_reward,
-    pick_best_shop_card,
     pick_grid_cards,
+    score_reward_options,
+    score_shop_card_options,
 )
 from ai.simulator import plan_best_sequence
 from spirecomm.spire.screen import RestOption
@@ -37,12 +40,7 @@ _priority = IroncladPriority()
 # ── 全局状态 ──────────────────────────────────────────────────────────────────
 _planned_uuids: list[str] = []
 _visited_shop: bool = False       # 防止重复进店循环
-
-# ── 地图节点优先级 ─────────────────────────────────────────────────────────────
-# E=精英  R=休息  ?=事件  T=宝箱  $=商店  M=普通怪
-_MAP_PRIORITY: dict[str, int] = {
-    "E": 0, "R": 1, "?": 2, "T": 3, "$": 4, "M": 5,
-}
+_skipped_card_reward_pending: bool = False
 
 # 危险事件 -> 选最后一个选项（通常为"离开/跳过"）
 # 来源：spirecomm SimpleAgent + bottled_ai CommonEventHandler
@@ -54,6 +52,131 @@ _DANGEROUS_EVENTS = frozenset({
 })
 
 
+def _set_candidates(game_state: Dict[str, Any], candidates: list[tuple[float, str, str]]) -> None:
+    game_state["_decision_candidates"] = [
+        {
+            "score": round(float(score), 3) if score != float("-inf") else score,
+            "action": action,
+            "reason": reason,
+        }
+        for score, action, reason in sorted(candidates, key=lambda item: item[0], reverse=True)
+    ]
+
+
+def _pick_scored_action(
+    game_state: Dict[str, Any],
+    candidates: list[tuple[float, str, str]],
+    default_action: str,
+    default_reason: str,
+) -> str:
+    if not candidates:
+        _set_candidates(game_state, [])
+        game_state["_decision_reason"] = default_reason
+        return default_action
+
+    _set_candidates(game_state, candidates)
+    score, action, reason = max(candidates, key=lambda item: item[0])
+    if score == float("-inf"):
+        game_state["_decision_reason"] = default_reason
+        return default_action
+
+    game_state["_decision_reason"] = reason
+    return action
+
+
+def _score_map_node(symbol: str, game_state: Dict[str, Any]) -> float:
+    hp_ratio = (game_state.get("current_hp", 1) or 1) / (game_state.get("max_hp", 80) or 80)
+    gold = game_state.get("gold", 0) or 0
+    floor = game_state.get("floor", 0) or 0
+
+    base_scores = {
+        "E": 26.0,
+        "R": 17.0,
+        "?": 16.0,
+        "T": 15.0,
+        "$": 14.0,
+        "M": 12.0,
+    }
+    score = base_scores.get(symbol, 0.0)
+
+    if symbol == "E":
+        score += 6.0 if hp_ratio >= 0.70 else -10.0
+    if symbol == "R":
+        score += 12.0 if hp_ratio < 0.45 else 0.0
+        score += 8.0 if floor % 17 == 15 and hp_ratio < 0.85 else 0.0
+    if symbol == "$":
+        score += 8.0 if gold >= 150 else -4.0
+    if symbol == "?":
+        score += 4.0 if hp_ratio >= 0.60 else -3.0
+
+    return score
+
+
+def _score_shop_relic(relic, gold: int) -> tuple[float, str]:
+    price = int(getattr(relic, "price", 9999) or 9999)
+    if gold < price:
+        return float("-inf"), "shop_relic_unaffordable"
+
+    relic_id = getattr(relic, "relic_id", "?")
+    score = 8.0 - (price / 55.0)
+    if gold - price < 75:
+        score -= 2.5
+
+    premium_ids = {
+        "Bag of Preparation", "Lantern", "Anchor", "Preserved Insect",
+        "Oddly Smooth Stone", "Pen Nib", "Horn Cleat", "Orichalcum",
+        "Membership Card", "Vajra", "Happy Flower",
+    }
+    if relic_id in premium_ids:
+        score += 5.0
+
+    return score, f"shop_relic_{relic_id}_price={price}"
+
+
+def _score_event_option(event_id: str, option: dict[str, Any], index: int, total_options: int) -> tuple[float, str]:
+    if option.get("disabled", False):
+        return float("-inf"), f"event_option_{index}_disabled"
+
+    text = str(option.get("text", "") or "").lower()
+    score = 3.0 - (index * 0.2)
+    reason = f"event_pick_{index}"
+
+    if event_id in _DANGEROUS_EVENTS:
+        score = 10.0 if index == total_options - 1 else -8.0
+        reason = f"event_avoid_{event_id}_{index}"
+
+    leave_words = ("leave", "skip", "ignore", "walk away")
+    reward_words = ("gold", "relic", "card", "max hp", "remove", "transform", "upgrade")
+    downside_words = ("curse", "damage", "lose hp", "regret", "pain", "wound")
+
+    if any(word in text for word in reward_words):
+        score += 2.5
+        reason = f"event_reward_{index}"
+    if any(word in text for word in downside_words):
+        score -= 3.0
+        reason = f"event_risky_{index}"
+    if any(word in text for word in leave_words):
+        score -= 1.0
+        reason = f"event_leave_{index}"
+
+    return score, reason
+
+
+def _score_hand_select_combo(combo: tuple[int, ...], cards: list, for_exhaust: bool = True) -> tuple[float, str]:
+    score = 0.0
+    parts = []
+    for idx in combo:
+        card = cards[idx]
+        priority = card_priority_score(card)
+        if priority == float("inf"):
+            priority = 250.0
+        score += float(priority)
+        parts.append(getattr(card, "card_id", "?"))
+    if for_exhaust:
+        return score, f"hand_select_exhaust_{'_'.join(parts)}"
+    return score, f"hand_select_{'_'.join(parts)}"
+
+
 # =============================================================================
 # 公开接口
 # =============================================================================
@@ -63,7 +186,11 @@ def decide_action(game_state: Dict[str, Any]) -> str:
     顶层分发：根据 screen_type 调用对应子决策器。
     返回 spirecomm action 字符串，并将原因写入 game_state["_decision_reason"]。
     """
+    global _skipped_card_reward_pending
     screen_type = game_state.get("screen_type", "")
+
+    if screen_type not in {"CARD_REWARD", "COMBAT_REWARD"}:
+        _skipped_card_reward_pending = False
 
     if screen_type == "MAP":           return _decide_map(game_state)
     if screen_type == "CARD_REWARD":   return _decide_card_reward(game_state)
@@ -92,33 +219,90 @@ def decide_action(game_state: Dict[str, Any]) -> str:
 # =============================================================================
 
 def _decide_combat_reward(game_state: Dict[str, Any]) -> str:
-    """逐一领取战斗奖励；找到 CARD 类型时打开选牌界面。"""
+    """对战斗奖励候选动作打分，允许“跳过剩余奖励”作为显式决策。"""
+    global _skipped_card_reward_pending
     rewards = game_state.get("combat_rewards", [])
+    if not rewards:
+        _skipped_card_reward_pending = False
+        game_state["_decision_reason"] = "proceed_rewards"
+        return "proceed_combat_reward"
+
+    potions_full = bool(game_state.get("potions_full", False))
+    candidates: list[tuple[float, str, str]] = []
     for i, r in enumerate(rewards):
         rtype = getattr(getattr(r, "reward_type", None), "name", "")
         if rtype == "CARD":
-            game_state["_decision_reason"] = "open_card_reward"
-            return f"take_combat_reward_{i}"
-    game_state["_decision_reason"] = "proceed_rewards"
-    return "proceed_combat_reward"
+            score = -25.0 if _skipped_card_reward_pending else 20.0
+            candidates.append((score, f"take_combat_reward_{i}", "open_card_reward"))
+            continue
+        if rtype == "POTION":
+            if potions_full:
+                continue
+            candidates.append((11.0, f"take_combat_reward_{i}", "take_reward_potion"))
+            continue
+        if rtype == "RELIC":
+            candidates.append((18.0, f"take_combat_reward_{i}", "take_reward_relic"))
+            continue
+        if rtype == "SAPPHIRE_KEY":
+            candidates.append((16.0, f"take_combat_reward_{i}", "take_reward_key"))
+            continue
+        if rtype in {"GOLD", "STOLEN_GOLD"}:
+            gold_amount = float(getattr(r, "gold", 0) or 0)
+            candidates.append((12.0 + min(gold_amount / 25.0, 6.0), f"take_combat_reward_{i}", "take_reward_gold"))
+            continue
+        candidates.append((8.0, f"take_combat_reward_{i}", f"take_reward_{rtype.lower()}"))
+
+    if _skipped_card_reward_pending:
+        has_non_card_claim = any(
+            action.startswith("take_combat_reward_") and reason != "open_card_reward"
+            for _, action, reason in candidates
+        )
+        skip_score = 1.0 if has_non_card_claim else 14.0
+        candidates.append((skip_score, "skip_combat_reward", "skip_remaining_rewards"))
+
+    action = _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="skip_combat_reward",
+        default_reason="skip_unclaimable_rewards",
+    )
+    if action == "skip_combat_reward":
+        _skipped_card_reward_pending = False
+    return action
 
 
 def _decide_card_reward(game_state: Dict[str, Any]) -> str:
-    """按当前牌组协同选择奖励卡，必要时跳过。"""
+    """把“拿哪张卡”和“跳过”统一成同一个打分决策。"""
+    global _skipped_card_reward_pending
     cards = game_state.get("reward_cards", [])
-    idx, card, reason = pick_best_reward(
+    scored_cards, skip_threshold = score_reward_options(
         cards,
         deck_cards=game_state.get("deck_cards", []),
         relic_ids=game_state.get("relic_ids", []),
         floor=game_state.get("floor"),
         act=game_state.get("act"),
-        can_skip=game_state.get("card_reward_can_skip", True),
     )
-    if idx is None:
-        game_state["_decision_reason"] = f"reward_skip_{reason}"
-        return "skip_card_reward"
-    game_state["_decision_reason"] = f"reward_{getattr(card, 'card_id', '?')}_{reason}"
-    return f"choose_card_reward_{idx}"
+
+    candidates = [
+        (score - skip_threshold, f"choose_card_reward_{idx}", f"reward_{getattr(card, 'card_id', '?')}_{reason}")
+        for score, idx, card, reason in scored_cards
+    ]
+    if game_state.get("card_reward_can_skip", True):
+        candidates.append((0.0, "skip_card_reward", "reward_skip_threshold"))
+
+    action = _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="skip_card_reward",
+        default_reason="reward_skip_empty",
+    )
+    if action == "skip_card_reward":
+        _skipped_card_reward_pending = True
+        game_state["_decision_reason"] = f"{game_state['_decision_reason']}_skip"
+        return action
+
+    _skipped_card_reward_pending = False
+    return action
 
 
 # =============================================================================
@@ -142,7 +326,7 @@ def _decide_boss_reward(game_state: Dict[str, Any]) -> str:
 # =============================================================================
 
 def _decide_map(game_state: Dict[str, Any]) -> str:
-    """按节点类型优先级选择最优路径。"""
+    """地图路线选择也走候选动作打分。"""
     map_nodes      = game_state.get("map_nodes", [])
     boss_available = game_state.get("boss_available", False)
     choice_available = game_state.get("choice_available", False)
@@ -156,12 +340,18 @@ def _decide_map(game_state: Dict[str, Any]) -> str:
         )
         return "wait"
 
-    best_idx = min(
-        range(len(map_nodes)),
-        key=lambda i: _MAP_PRIORITY.get(map_nodes[i]["symbol"], 99),
+    candidates = []
+    for idx, node in enumerate(map_nodes):
+        symbol = node.get("symbol", "?")
+        score = _score_map_node(symbol, game_state)
+        candidates.append((score, f"choose_map_node_{idx}", f"map_{symbol}"))
+
+    return _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="wait",
+        default_reason="map_wait_transition",
     )
-    game_state["_decision_reason"] = f"map_{map_nodes[best_idx]['symbol']}"
-    return f"choose_map_node_{best_idx}"
 
 
 # =============================================================================
@@ -169,12 +359,19 @@ def _decide_map(game_state: Dict[str, Any]) -> str:
 # =============================================================================
 
 def _decide_chest(game_state: Dict[str, Any]) -> str:
-    """宝箱未开就开，已开就推进。"""
+    """宝箱也作为显式动作候选处理。"""
+    candidates: list[tuple[float, str, str]] = []
     if game_state.get("chest_open", False):
-        game_state["_decision_reason"] = "chest_proceed"
-        return "proceed"
-    game_state["_decision_reason"] = "open_chest"
-    return "open_chest"
+        candidates.append((8.0, "proceed", "chest_proceed"))
+    else:
+        candidates.append((10.0, "open_chest", "open_chest"))
+        candidates.append((-2.0, "proceed", "chest_skip"))
+    return _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="proceed",
+        default_reason="chest_proceed",
+    )
 
 
 # =============================================================================
@@ -192,19 +389,16 @@ def _decide_event(game_state: Dict[str, Any]) -> str:
     if not options:
         game_state["_decision_reason"] = "event_proceed"
         return "proceed"
-
-    if event_id in _DANGEROUS_EVENTS:
-        idx = len(options) - 1
-        game_state["_decision_reason"] = f"event_avoid_{event_id}"
-        return f"choose_event_{idx}"
-
+    candidates = []
     for i, opt in enumerate(options):
-        if not opt.get("disabled", False):
-            game_state["_decision_reason"] = f"event_pick_{i}"
-            return f"choose_event_{i}"
-
-    game_state["_decision_reason"] = "event_fallback"
-    return "choose_event_0"
+        score, reason = _score_event_option(event_id, opt, i, len(options))
+        candidates.append((score, f"choose_event_{i}", reason))
+    return _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="choose_event_0",
+        default_reason="event_fallback",
+    )
 
 
 # =============================================================================
@@ -241,33 +435,30 @@ def _decide_rest(game_state: Dict[str, Any]) -> str:
         return "proceed"
 
     hp_ratio = current_hp / max_hp
+    candidates: list[tuple[float, str, str]] = [(0.0, "proceed", "rest_proceed")]
 
-    if RestOption.REST in rest_options and hp_ratio < 0.50:
-        game_state["_decision_reason"] = "rest_heal_low"
-        return "rest_REST"
+    if RestOption.REST in rest_options:
+        rest_score = (1.0 - hp_ratio) * 30.0
+        if hp_ratio < 0.50:
+            rest_score += 12.0
+        if act > 1 and floor_num % 17 == 15 and hp_ratio < 0.90:
+            rest_score += 10.0
+        candidates.append((rest_score, "rest_REST", "rest_heal"))
 
-    if (RestOption.REST in rest_options
-            and act > 1
-            and floor_num % 17 == 15
-            and hp_ratio < 0.90):
-        game_state["_decision_reason"] = "rest_heal_preboss"
-        return "rest_REST"
-
-    if RestOption.SMITH in rest_options and upgrade_gain >= 4:
-        game_state["_decision_reason"] = "rest_smith"
-        return "rest_SMITH"
+    if RestOption.SMITH in rest_options:
+        smith_score = upgrade_gain - max(0.0, (0.60 - hp_ratio) * 20.0)
+        candidates.append((smith_score, "rest_SMITH", "rest_smith"))
 
     for option in (RestOption.LIFT, RestOption.DIG, RestOption.TOKE, RestOption.RECALL):
         if option in rest_options:
-            game_state["_decision_reason"] = f"rest_{option.name}"
-            return f"rest_{option.name}"
+            candidates.append((6.0, f"rest_{option.name}", f"rest_{option.name}"))
 
-    if RestOption.REST in rest_options and hp_ratio < 1.0:
-        game_state["_decision_reason"] = "rest_heal_notfull"
-        return "rest_REST"
-
-    game_state["_decision_reason"] = "rest_proceed"
-    return "proceed"
+    return _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="proceed",
+        default_reason="rest_proceed",
+    )
 
 
 # =============================================================================
@@ -275,25 +466,39 @@ def _decide_rest(game_state: Dict[str, Any]) -> str:
 # =============================================================================
 
 def _decide_shop_room(game_state: Dict[str, Any]) -> str:
-    """第一次进入商店，第二次（离开后）推进。"""
+    """商店房间的进入/离开也显式进入决策。"""
     global _visited_shop
+    gold = game_state.get("gold", 0) or 0
+    hp_ratio = (game_state.get("current_hp", 1) or 1) / (game_state.get("max_hp", 80) or 80)
     if _visited_shop:
         _visited_shop = False
-        game_state["_decision_reason"] = "shop_leave_room"
-        return "proceed"
-    _visited_shop = True
-    game_state["_decision_reason"] = "enter_shop"
-    return "enter_shop"
+        return _pick_scored_action(
+            game_state,
+            [(8.0, "proceed", "shop_leave_room"), (-4.0, "enter_shop", "shop_reenter_loop")],
+            default_action="proceed",
+            default_reason="shop_leave_room",
+        )
+
+    enter_score = 6.0 + min(gold / 60.0, 5.0)
+    if hp_ratio < 0.35:
+        enter_score -= 2.0
+    candidates = [
+        (enter_score, "enter_shop", "enter_shop"),
+        (1.0, "proceed", "shop_skip_room"),
+    ]
+    action = _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="enter_shop",
+        default_reason="enter_shop",
+    )
+    if action == "enter_shop":
+        _visited_shop = True
+    return action
 
 
 def _decide_shop_screen(game_state: Dict[str, Any]) -> str:
-    """
-    购物优先级（来自 spirecomm SimpleAgent）：
-      1. 净化（去除最差牌）
-      2. 买值得买的卡牌
-      3. 买遗物
-      4. 离开
-    """
+    """商店里的买/不买/净化/离开统一走候选动作打分。"""
     gold         = game_state.get("gold", 0)
     shop_cards   = game_state.get("shop_cards", [])
     shop_relics  = game_state.get("shop_relics", [])
@@ -303,12 +508,20 @@ def _decide_shop_screen(game_state: Dict[str, Any]) -> str:
     act          = game_state.get("act", 1)
     purge_avail  = game_state.get("purge_available", False)
     purge_cost   = game_state.get("purge_cost", 9999)
+    candidates: list[tuple[float, str, str]] = [(0.0, "shop_leave", "shop_leave")]
 
     if purge_avail and gold >= purge_cost:
-        game_state["_decision_reason"] = "shop_purge"
-        return "shop_purge"
+        purge_gain = estimate_purge_gain(
+            deck_cards,
+            deck_cards=deck_cards,
+            relic_ids=relic_ids,
+            floor=floor_num,
+            act=act,
+        )
+        purge_score = purge_gain - (purge_cost / 45.0)
+        candidates.append((purge_score, "shop_purge", f"shop_purge_gain={purge_gain:.1f}_cost={purge_cost}"))
 
-    card_idx, card, reason = pick_best_shop_card(
+    scored_cards, buy_threshold = score_shop_card_options(
         shop_cards,
         gold=gold,
         deck_cards=deck_cards,
@@ -316,18 +529,19 @@ def _decide_shop_screen(game_state: Dict[str, Any]) -> str:
         floor=floor_num,
         act=act,
     )
-    if card_idx is not None:
-        game_state["_decision_reason"] = f"shop_card_{getattr(card,'card_id','?')}_{reason}"
-        return f"buy_card_{card_idx}"
+    for score, idx, card, reason in scored_cards:
+        candidates.append((score - buy_threshold, f"buy_card_{idx}", f"shop_card_{getattr(card,'card_id','?')}_{reason}"))
 
     for i, relic in enumerate(shop_relics):
-        price = getattr(relic, "price", 9999)
-        if gold >= price:
-            game_state["_decision_reason"] = f"shop_relic_{getattr(relic,'relic_id','?')}"
-            return f"buy_relic_{i}"
+        score, reason = _score_shop_relic(relic, gold)
+        candidates.append((score, f"buy_relic_{i}", reason))
 
-    game_state["_decision_reason"] = "shop_leave"
-    return "shop_leave"
+    return _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="shop_leave",
+        default_reason="shop_leave",
+    )
 
 
 # =============================================================================
@@ -378,7 +592,7 @@ def _decide_grid(game_state: Dict[str, Any]) -> str:
 # =============================================================================
 
 def _decide_hand_select(game_state: Dict[str, Any]) -> str:
-    """从手牌中选择最差的 N 张（通常用于净化/变形）。"""
+    """手牌选择改成组合候选打分。"""
     if not game_state.get("choice_available", False):
         game_state["_decision_reason"] = "hand_select_not_ready"
         return "proceed"
@@ -390,21 +604,18 @@ def _decide_hand_select(game_state: Dict[str, Any]) -> str:
         game_state["_decision_reason"] = "hand_select_no_cards"
         return "proceed"
 
-    sorted_cards = _priority.get_sorted_cards(cards, reverse=True)
-    selected     = sorted_cards[:num_cards]
-    indices      = []
-    for c in selected:
-        try:
-            indices.append(cards.index(c))
-        except ValueError:
-            pass
+    candidates: list[tuple[float, str, str]] = []
+    for combo in combinations(range(len(cards)), num_cards):
+        score, reason = _score_hand_select_combo(combo, cards)
+        action = "hand_select_" + "_".join(str(i) for i in combo)
+        candidates.append((score, action, reason))
 
-    if not indices:
-        game_state["_decision_reason"] = "hand_select_no_indices"
-        return "proceed"
-
-    game_state["_decision_reason"] = "hand_select"
-    return "hand_select_" + "_".join(str(i) for i in indices)
+    return _pick_scored_action(
+        game_state,
+        candidates,
+        default_action="proceed",
+        default_reason="hand_select_no_indices",
+    )
 
 
 def _decide_game_over(game_state: Dict[str, Any]) -> str:

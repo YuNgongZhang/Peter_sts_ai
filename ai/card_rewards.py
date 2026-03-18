@@ -73,17 +73,15 @@ def pick_best_reward(
     if not cards:
         return None, None, "skip_empty"
 
-    deck_cards = list(deck_cards or [])
-    relic_ids = list(relic_ids or [])
-    profile = _build_deck_profile(deck_cards, relic_ids)
-
-    scored_cards: list[tuple[float, object, str]] = []
-    for card in cards:
-        score, reason = _score_candidate(card, profile, floor=floor, act=act)
-        scored_cards.append((score, card, reason))
-
-    best_score, best_card, best_reason = max(scored_cards, key=lambda item: item[0])
-    if can_skip and best_score < -10.0:
+    scored_cards, skip_threshold = score_reward_options(
+        cards,
+        deck_cards=deck_cards,
+        relic_ids=relic_ids,
+        floor=floor,
+        act=act,
+    )
+    best_score, _, best_card, best_reason = max(scored_cards, key=lambda item: item[0])
+    if can_skip and best_score < skip_threshold:
         return None, None, "skip_low_value"
     return cards.index(best_card), best_card, best_reason
 
@@ -99,10 +97,51 @@ def pick_best_shop_card(
     if not cards:
         return None, None, "shop_no_cards"
 
+    scored_cards, buy_threshold = score_shop_card_options(
+        cards,
+        gold=gold,
+        deck_cards=deck_cards,
+        relic_ids=relic_ids,
+        floor=floor,
+        act=act,
+    )
+    if not scored_cards:
+        return None, None, "shop_skip_low_value"
+    best_score, best_idx, best_card, best_reason = max(scored_cards, key=lambda item: item[0])
+    if best_score < buy_threshold:
+        return None, None, "shop_skip_low_value"
+    return best_idx, best_card, best_reason
+
+
+def score_reward_options(
+    cards: list,
+    deck_cards: list | None = None,
+    relic_ids: list[str] | None = None,
+    floor: int | None = None,
+    act: int | None = None,
+) -> tuple[list[tuple[float, int, object, str]], float]:
     deck_cards = list(deck_cards or [])
     relic_ids = list(relic_ids or [])
     profile = _build_deck_profile(deck_cards, relic_ids)
-    best: tuple[float, int, object, str] | None = None
+    scored_cards: list[tuple[float, int, object, str]] = []
+    for idx, card in enumerate(cards):
+        score, reason = _score_candidate(card, profile, floor=floor, act=act)
+        scored_cards.append((score, idx, card, reason))
+    return scored_cards, _reward_skip_threshold(deck_cards, floor=floor, act=act)
+
+
+def score_shop_card_options(
+    cards: list,
+    gold: int,
+    deck_cards: list | None = None,
+    relic_ids: list[str] | None = None,
+    floor: int | None = None,
+    act: int | None = None,
+) -> tuple[list[tuple[float, int, object, str]], float]:
+    deck_cards = list(deck_cards or [])
+    relic_ids = list(relic_ids or [])
+    profile = _build_deck_profile(deck_cards, relic_ids)
+    scored_cards: list[tuple[float, int, object, str]] = []
 
     for idx, card in enumerate(cards):
         price = int(getattr(card, "price", 9999) or 9999)
@@ -112,12 +151,9 @@ def pick_best_shop_card(
         value_score = raw_score - (price / 40.0)
         if gold - price < 75:
             value_score -= 1.5
-        if best is None or value_score > best[0]:
-            best = (value_score, idx, card, f"shop_{reason}_price={price}")
+        scored_cards.append((value_score, idx, card, f"shop_{reason}_price={price}"))
 
-    if best is None or best[0] < -1.5:
-        return None, None, "shop_skip_low_value"
-    return best[1], best[2], best[3]
+    return scored_cards, -1.5
 
 
 def pick_grid_cards(
@@ -171,6 +207,23 @@ def estimate_best_upgrade_gain(
     profile = _build_deck_profile(deck_cards, relic_ids)
     gains = [_upgrade_gain(card, profile, floor=floor, act=act) for card in cards]
     return max(gains, default=float("-inf"))
+
+
+def estimate_purge_gain(
+    cards: list,
+    deck_cards: list | None = None,
+    relic_ids: list[str] | None = None,
+    floor: int | None = None,
+    act: int | None = None,
+) -> float:
+    if not cards:
+        return float("-inf")
+
+    deck_cards = list(deck_cards or cards or [])
+    relic_ids = list(relic_ids or [])
+    profile = _build_deck_profile(deck_cards, relic_ids)
+    purge_values = [_purge_value(card, profile, floor=floor, act=act) for card in cards]
+    return -min(purge_values, default=float("inf"))
 
 
 def _build_deck_profile(deck_cards: list, relic_ids: list[str]) -> dict[str, object]:
@@ -354,15 +407,28 @@ def _score_candidate(
             score += 8
             reasons.append("act1_aoe")
         if card_id in {
-            "Anger", "Cleave", "Clothesline", "Flame Barrier", "Headbutt",
-            "Iron Wave", "Pommel Strike", "Shrug It Off", "Twin Strike",
-            "Uppercut", "Carnage", "Immolate",
+            "Anger", "Armaments", "Cleave", "Clothesline", "Flame Barrier",
+            "Headbutt", "Iron Wave", "Pommel Strike", "Shrug It Off",
+            "Spot Weakness", "True Grit", "Twin Strike", "Uppercut",
+            "Warcry", "Carnage", "Immolate",
         }:
             score += 8
             reasons.append("act1_tempo")
         if card_id in SLOW_SETUP_CARDS:
             score -= 10
             reasons.append("too_slow_for_act1")
+        if card_id == "Armaments":
+            score += 6
+            reasons.append("act1_upgrade_density")
+        if card_id == "Spot Weakness":
+            score += 6
+            reasons.append("act1_boss_scaling")
+        if card_id == "True Grit":
+            score += 5
+            reasons.append("act1_block_plus_exhaust")
+        if card_id == "Warcry" and int(profile["draw"]) < 2:
+            score += 4
+            reasons.append("act1_cycle_help")
 
     if late_game and card_id in SLOW_SETUP_CARDS:
         score += 6
@@ -453,3 +519,20 @@ def card_priority_score(card) -> float:
     return _priority.CARD_PRIORITIES.get(
         getattr(card, "card_id", ""), math.inf
     )
+
+
+def _reward_skip_threshold(
+    deck_cards: list | None,
+    floor: int | None,
+    act: int | None,
+) -> float:
+    deck_size = len(deck_cards or [])
+    act = act or 1
+    floor = floor or 0
+    if act == 1 and floor <= 16 and deck_size <= 18:
+        return -18.0
+    if act == 1:
+        return -14.0
+    if act == 2:
+        return -12.0
+    return -10.0

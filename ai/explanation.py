@@ -16,6 +16,9 @@ def explain_action(game_state: Dict[str, Any], action: str) -> str:
     if action == "skip_card_reward":
         return f"Skipping card reward. Reason: {reason}."
 
+    if action == "skip_combat_reward":
+        return f"Skipping remaining combat rewards. Reason: {reason}."
+
     if action.startswith("choose_card_reward_"):
         card_name = _screen_card_name(action, game_state.get("reward_cards") or [])
         return f"Taking reward card {card_name}. Reason: {reason}."

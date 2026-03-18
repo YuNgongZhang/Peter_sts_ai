@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from spirecomm.communication.coordinator import Coordinator
 from spirecomm.communication.action import (
+    Action,
     StartGameAction,
     StateAction, PlayCardAction, EndTurnAction, ProceedAction, CancelAction,
     ChooseAction, ChooseMapNodeAction, ChooseMapBossAction,
@@ -400,7 +401,16 @@ def _build_spirecomm_action(action_str: str, game_state):
             return ChooseAction(choice_index=int(tail))
 
     # ── 战斗奖励 ──────────────────────────────────────────────────────────────
-    if action_str in ("skip_card_reward", "proceed_combat_reward"):
+    if action_str == "skip_card_reward":
+        # Card reward skip is exposed by CommunicationMod as a left-side skip/return button,
+        # not the right-side proceed button.
+        return Action(command="skip")
+
+    if action_str == "skip_combat_reward":
+        # Once claimable rewards are exhausted, leaving the combat reward screen uses proceed.
+        return ProceedAction()
+
+    if action_str == "proceed_combat_reward":
         return ProceedAction()
 
     if action_str.startswith("choose_card_reward_"):
@@ -433,7 +443,9 @@ def _build_spirecomm_action(action_str: str, game_state):
             return ProceedAction()
         relics = getattr(screen, "relics", []) if screen else []
         if idx < len(relics):
-            return BossRewardAction(relics[idx])
+            # BossRewardAction 用 relic.name，中文客户端下本地化名称可能导致命令失配。
+            # 直接发 choose <index> 更稳定。
+            return ChooseAction(choice_index=idx)
         return ProceedAction()
 
     # ── 地图 ──────────────────────────────────────────────────────────────────
@@ -760,6 +772,7 @@ def on_state_change(game_state):
         "card_reward_can_skip": card_reward_can_skip,
         "card_reward_can_bowl": card_reward_can_bowl,
         "combat_rewards":    combat_rewards,
+        "potions_full":      bool(game_state.are_potions_full()),
         "boss_relics":       boss_relics,
         "deck_cards":        deck_cards,
         "deck_card_ids":     deck_card_ids,
