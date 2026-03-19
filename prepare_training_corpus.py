@@ -70,6 +70,19 @@ def main() -> None:
 
     for session_dir in sessions:
         episode_summaries = load_episode_summaries(session_dir)
+        if not episode_summaries:
+            drop_reasons["session_without_episodes"] += 1
+            session_rows.append(
+                {
+                    "session": session_dir.name,
+                    "raw_records": 0,
+                    "bc_all_rows": 0,
+                    "bc_noncombat_rows": 0,
+                    "episodes": 0,
+                    "status": "skipped_no_episodes",
+                }
+            )
+            continue
         raw_count = 0
         kept_all = 0
         kept_noncombat = 0
@@ -105,6 +118,7 @@ def main() -> None:
                 "bc_all_rows": kept_all,
                 "bc_noncombat_rows": kept_noncombat,
                 "episodes": len(episode_summaries),
+                "status": "included",
             }
         )
 
@@ -120,7 +134,8 @@ def main() -> None:
     lines = [
         "# Training Corpus Report",
         "",
-        f"- Sessions processed: {len(sessions)}",
+        f"- Sessions discovered: {len(sessions)}",
+        f"- Sessions included: {sum(1 for row in session_rows if row.get('status') == 'included')}",
         f"- Total BC rows (all screens): {len(merged_all)}",
         f"- Total BC rows (non-combat): {len(merged_noncombat)}",
         f"- Dropped rows: {sum(drop_reasons.values())}",

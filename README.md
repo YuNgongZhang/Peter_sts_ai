@@ -198,6 +198,11 @@ This writes:
 - `training_table.bc_noncombat.jsonl`
 - `dataset_report.md`
 
+Default cleaning rules:
+- drop purely mechanical `GAME_OVER` / `COMPLETE` rows
+- drop obvious `possible_state_leak` rows
+- keep structured fields and ids; do not rely on noisy text fields for training
+
 Recommended order on a cloud machine with accumulated data:
 ```powershell
 py -3 validate_dataset.py --data-dir training_data --session <session_id>
@@ -217,6 +222,8 @@ This writes a merged corpus under `training_data\_prepared\`:
 - `training_corpus.bc_noncombat.jsonl`
 - `training_corpus_report.md`
 - `sessions_index.json`
+
+The corpus builder skips sessions that have no episode summaries (`0 episode` sessions).
 
 Optional combat search tuning:
 - `STS_AI_DFS_TIMEOUT_MS` controls the per-turn DFS timeout in milliseconds

@@ -119,6 +119,51 @@ def _normalize_candidates(candidates) -> list[dict]:
     return normalized
 
 
+def _starter_expected_count(card_id: str) -> int:
+    if card_id == "Strike_R":
+        return 5
+    if card_id == "Defend_R":
+        return 4
+    if card_id == "Bash":
+        return 1
+    return 0
+
+
+def _detect_state_leak(record: dict) -> str | None:
+    state = record.get("state", {}) if isinstance(record.get("state"), dict) else {}
+    action = str(record.get("action", ""))
+    deck_ids = state.get("deck_card_ids", [])
+    relic_ids = state.get("relic_ids", [])
+
+    if action.startswith("choose_card_reward_"):
+        reward_cards = state.get("reward_cards", [])
+        try:
+            idx = int(action.split("_")[-1])
+        except ValueError:
+            idx = -1
+        if 0 <= idx < len(reward_cards):
+            chosen = reward_cards[idx]
+            if isinstance(chosen, dict):
+                chosen_id = str(chosen.get("card_id", ""))
+                if chosen_id and deck_ids.count(chosen_id) > _starter_expected_count(chosen_id):
+                    return f"possible_state_leak:card_reward:{chosen_id}"
+
+    if action.startswith("take_boss_reward_"):
+        boss_relics = state.get("boss_relics", [])
+        try:
+            idx = int(action.split("_")[-1])
+        except ValueError:
+            idx = -1
+        if 0 <= idx < len(boss_relics):
+            chosen = boss_relics[idx]
+            if isinstance(chosen, dict):
+                chosen_id = str(chosen.get("relic_id", ""))
+                if chosen_id and chosen_id in relic_ids:
+                    return f"possible_state_leak:boss_relic:{chosen_id}"
+
+    return None
+
+
 def _clean_state_features(state: dict) -> dict:
     return {
         "player_hp": state.get("player_hp"),
@@ -195,6 +240,9 @@ def _drop_reason(record: dict) -> str | None:
     screen_type = str(record.get("screen_type", ""))
     if screen_type in MECHANICAL_SCREENS:
         return f"mechanical_screen:{screen_type}"
+    leak_reason = _detect_state_leak(record)
+    if leak_reason:
+        return leak_reason
     return None
 
 
