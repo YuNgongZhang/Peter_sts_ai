@@ -188,6 +188,36 @@ The export writes `training_table.jsonl` inside the session directory and joins:
 - per-step decision traces from `instance-*.jsonl`
 - per-episode outcomes from `instance-*.episodes.jsonl`
 
+Create behavior-cloning-ready cleaned tables from a collected session:
+```powershell
+py -3 export_clean_training_table.py --data-dir training_data --session <session_id>
+```
+
+This writes:
+- `training_table.bc_all.jsonl`
+- `training_table.bc_noncombat.jsonl`
+- `dataset_report.md`
+
+Recommended order on a cloud machine with accumulated data:
+```powershell
+py -3 validate_dataset.py --data-dir training_data --session <session_id>
+py -3 export_training_table.py --data-dir training_data --session <session_id>
+py -3 export_clean_training_table.py --data-dir training_data --session <session_id>
+```
+
+Use `training_table.bc_noncombat.jsonl` first if you want the most stable first-pass BC dataset.
+
+If your cloud machine has many collected sessions under `training_data/`, build one merged corpus:
+```powershell
+py -3 prepare_training_corpus.py --data-dir training_data
+```
+
+This writes a merged corpus under `training_data\_prepared\`:
+- `training_corpus.bc_all.jsonl`
+- `training_corpus.bc_noncombat.jsonl`
+- `training_corpus_report.md`
+- `sessions_index.json`
+
 Optional combat search tuning:
 - `STS_AI_DFS_TIMEOUT_MS` controls the per-turn DFS timeout in milliseconds
 - `STS_AI_DFS_MAX_NODES` controls the per-turn DFS node budget
